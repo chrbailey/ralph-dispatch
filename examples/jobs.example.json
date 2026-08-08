@@ -1,0 +1,36 @@
+{
+  "jobs": [
+    {
+      "ref": "acme-who",
+      "kind": "dossier_section",
+      "idempotency_key": "example:acme:who",
+      "payload": {
+        "task": "Extract the WHO section for Acme from the evidence pack.",
+        "section": "WHO",
+        "evidence": [
+          {
+            "source_id": "acme-about",
+            "url": "https://example.com/acme/about",
+            "excerpt": "Acme says Jane Example founded the company in 2024."
+          }
+        ]
+      }
+    },
+    {
+      "ref": "acme-dossier",
+      "kind": "dossier_assemble",
+      "idempotency_key": "example:acme:dossier",
+      "depends_on": ["acme-who"],
+      "payload": {
+        "task": "Assemble Acme's full dossier using the documented viability rubric.",
+        "evidence": [
+          {
+            "source_id": "acme-about",
+            "url": "https://example.com/acme/about",
+            "excerpt": "Acme says Jane Example founded the company in 2024."
+          }
+        ]
+      }
+    }
+  ]
+}

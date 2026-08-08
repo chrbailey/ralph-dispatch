@@ -1,0 +1,40 @@
+name: validation
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install validation tooling
+        run: python -m pip install coverage==7.10.1 ruff==0.12.8
+      - name: Lint and format check
+        run: |
+          ruff format --check dispatch.py seed.py tests
+          ruff check dispatch.py seed.py tests
+      - name: Compile
+        run: python -m compileall -q dispatch.py seed.py tests
+      - name: Test
+        run: |
+          coverage run --branch -m unittest discover -s tests -v
+          coverage report --fail-under=75
+      - name: CLI smoke test
+        run: |
+          tmp_dir="$(mktemp -d)"
+          tmp_db="$tmp_dir/dispatch.db"
+          python dispatch.py --db "$tmp_db" init >/dev/null
+          python dispatch.py --db "$tmp_db" audit

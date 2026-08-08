@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+*.db.lock
+*.db.stop
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.DS_Store

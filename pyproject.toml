@@ -1,0 +1,9 @@
+# Ralph Dispatch is intentionally run from its versioned checkout so prompts
+# remain co-versioned with the runtime. It is not published as a Python package.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

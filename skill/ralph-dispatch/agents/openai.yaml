@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ralph Dispatch"
+  short_description: "Operate and audit bounded research batches"
+  default_prompt: "Use $ralph-dispatch to inspect this dispatch database and safely continue the batch."
