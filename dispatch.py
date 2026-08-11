@@ -510,14 +510,23 @@ def db(
     if not db_path.parent.is_dir():
         raise FileNotFoundError(f"database directory does not exist: {db_path.parent}")
     creating = not db_path.exists()
-    conn = sqlite3.connect(str(db_path), timeout=30, isolation_level=None)
     if creating:
-        # Evidence excerpts and research text live in this file; keep a fresh
-        # database owner-only. SQLite creates -wal/-shm with the same mode.
-        # An operator who widened permissions deliberately is not overridden
-        # because only newly created databases are chmodded.
+        # Evidence excerpts and research text live in this file; create it
+        # owner-only from the first byte. A restrictive umask around connect
+        # closes the window where the file would briefly exist at 0666 & ~umask
+        # (0644 under the default) and a racing local reader could keep an open
+        # fd. SQLite then creates -wal/-shm matching the database mode. Only the
+        # creating branch tightens perms, so a deliberately widened existing
+        # database is not overridden.
+        old_umask = os.umask(0o077)
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=30, isolation_level=None)
+        finally:
+            os.umask(old_umask)
         with contextlib.suppress(OSError):
-            os.chmod(db_path, 0o600)
+            os.chmod(db_path, 0o600)  # belt-and-suspenders for exotic umasks
+    else:
+        conn = sqlite3.connect(str(db_path), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
@@ -2144,47 +2153,67 @@ def backup_database(
     row counts, and a matching event-chain head. A backup that cannot be read
     back faithfully is worse than none, so any mismatch raises.
     """
-    target = Path(out_path).expanduser().resolve(strict=False)
+    # Guard off the literal named path, never a resolved one: following a
+    # symlink here would let --force clobber the link's target, a file the
+    # operator never named. Refuse a symlinked output outright.
+    named = Path(out_path).expanduser()
+    if named.is_symlink():
+        raise DispatchError(f"backup target is a symlink; refusing to follow it: {named}")
     source = resolve_db_path(conn.execute("PRAGMA database_list").fetchone()[2])
+    target = named.resolve(strict=False)
     if target == source:
         raise DispatchError("backup target must differ from the live database path")
-    if target.exists():
-        if not force:
-            raise DispatchError(f"backup target exists; pass --force to replace: {target}")
-        target.unlink()
+    # Validate every precondition BEFORE touching the filesystem, so a failed
+    # backup can never destroy an existing good one.
     if conn.in_transaction:
         raise DispatchError("cannot back up inside an open transaction")
-    conn.execute("VACUUM INTO ?", (str(target),))
-    with contextlib.suppress(OSError):
-        os.chmod(target, 0o600)
-    copy = sqlite3.connect(str(target))
-    copy.row_factory = sqlite3.Row
+    if named.exists() and not force:
+        raise DispatchError(f"backup target exists; pass --force to replace: {named}")
+
+    # Write and verify a fresh temp copy, then replace atomically. The existing
+    # backup survives any failure (open transaction, disk full, bad copy).
+    tmp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
+    with contextlib.suppress(FileNotFoundError):
+        tmp.unlink()
     try:
-        integrity = copy.execute("PRAGMA integrity_check").fetchone()[0]
-        checks = {
-            "integrity_check": integrity,
-            "user_version_match": (
-                copy.execute("PRAGMA user_version").fetchone()[0]
-                == conn.execute("PRAGMA user_version").fetchone()[0]
-            ),
-            "jobs_count_match": (
-                copy.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-                == conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-            ),
-            "events_count_match": (
-                copy.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-                == conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-            ),
-            "chain_head_match": _event_chain_head(copy) == _event_chain_head(conn),
-        }
-    finally:
-        copy.close()
-    if integrity != "ok" or not all(
-        value is True for key, value in checks.items() if key != "integrity_check"
-    ):
+        old_umask = os.umask(0o077)  # temp copy is owner-only from creation
+        try:
+            conn.execute("VACUUM INTO ?", (str(tmp),))
+        finally:
+            os.umask(old_umask)
         with contextlib.suppress(OSError):
-            target.unlink()
-        raise DispatchError(f"backup verification failed: {checks}")
+            os.chmod(tmp, 0o600)
+        copy = sqlite3.connect(str(tmp))
+        copy.row_factory = sqlite3.Row
+        try:
+            integrity = copy.execute("PRAGMA integrity_check").fetchone()[0]
+            checks = {
+                "integrity_check": integrity,
+                "user_version_match": (
+                    copy.execute("PRAGMA user_version").fetchone()[0]
+                    == conn.execute("PRAGMA user_version").fetchone()[0]
+                ),
+                "jobs_count_match": (
+                    copy.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+                    == conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+                ),
+                "events_count_match": (
+                    copy.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                    == conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                ),
+                "chain_head_match": _event_chain_head(copy) == _event_chain_head(conn),
+            }
+        finally:
+            copy.close()
+        if integrity != "ok" or not all(
+            value is True for key, value in checks.items() if key != "integrity_check"
+        ):
+            raise DispatchError(f"backup verification failed: {checks}")
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
     return {"backup": str(target), "checks": checks, "chain_head": _event_chain_head(conn)}
 
 

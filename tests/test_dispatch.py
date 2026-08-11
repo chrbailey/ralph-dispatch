@@ -960,6 +960,64 @@ class TestV22Hardening(Base):
         with self.assertRaises(dispatch.DispatchError):
             dispatch.backup_database(self.conn, self.db_path)
 
+    def test_backup_failure_never_destroys_the_existing_backup(self):
+        client = FakeClient(worker=section_envelope())
+        self.enqueue_section()
+        dispatch.run(client, dispatch.Budget(max_calls=10), self.db_path)
+        target = Path(self.temporary.name) / "keep.db"
+        dispatch.backup_database(self.conn, target)
+        self.assertTrue(target.exists())
+        original = target.read_bytes()
+        # Force a failure (open transaction) on a --force overwrite: the prior
+        # backup must survive intact, with no orphaned temp file left behind.
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            with self.assertRaises(dispatch.DispatchError):
+                dispatch.backup_database(self.conn, target, force=True)
+        finally:
+            self.conn.rollback()
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_bytes(), original)
+        leftovers = list(Path(self.temporary.name).glob("keep.db.tmp-*"))
+        self.assertEqual(leftovers, [])
+
+    def test_backup_refuses_to_follow_a_symlinked_target(self):
+        client = FakeClient(worker=section_envelope())
+        self.enqueue_section()
+        dispatch.run(client, dispatch.Budget(max_calls=10), self.db_path)
+        victim = Path(self.temporary.name) / "precious.txt"
+        victim.write_bytes(b"PRECIOUS-NON-BACKUP-FILE")
+        link = Path(self.temporary.name) / "backup-link.db"
+        link.symlink_to(victim)
+        with self.assertRaises(dispatch.DispatchError):
+            dispatch.backup_database(self.conn, link, force=True)
+        # The unrelated file the symlink pointed at must be untouched.
+        self.assertEqual(victim.read_bytes(), b"PRECIOUS-NON-BACKUP-FILE")
+
+    def test_new_database_is_never_observable_at_a_permissive_mode(self):
+        old_umask = os.umask(0o022)
+        try:
+            path = Path(self.temporary.name) / "fresh.db"
+            observed = {}
+            real_chmod = os.chmod
+
+            def spy(target, mode):
+                if str(target) == str(path):
+                    observed["mode_before_chmod"] = os.stat(target).st_mode & 0o777
+                return real_chmod(target, mode)
+
+            os.chmod = spy
+            try:
+                dispatch.db(path).close()
+            finally:
+                os.chmod = real_chmod
+            # The file must already be owner-only when the explicit chmod runs,
+            # i.e. no 0644 window ever existed.
+            self.assertEqual(observed.get("mode_before_chmod"), 0o600)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        finally:
+            os.umask(old_umask)
+
     def test_backup_cli_round_trip(self):
         client = FakeClient(worker=section_envelope())
         self.enqueue_section()

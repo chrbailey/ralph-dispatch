@@ -72,6 +72,9 @@ evidence acquisition performed outside the process.
 | V38 | Databases and lock files were created at default umask; evidence text could be world-readable on a shared host | New databases and lock files are created owner-only (0600); SQLite WAL/SHM inherit the database mode | `test_V38_*` |
 | V39 | The event log was append-only by convention; a quiet UPDATE or DELETE left no trace | Each event row hash-chains to its predecessor; `audit` re-derives the chain and flags any edit, insert, or deletion; `status` and `backup` expose the chain head for external archival | `test_V39_*` |
 | V40 | Crash-orphaned budget reservations accumulated invisibly, silently eroding campaign headroom until a mystery ceiling hit | `status` reports orphaned (`reserved`-outcome) calls and input characters so drift is visible; reservations remain conservatively retained by design | `test_V40_*` |
+| V41 | `backup` unlinked the existing target before validating preconditions/writing, so any failure (open transaction, disk full) destroyed the prior backup with no replacement | `backup` validates every precondition first, writes/verifies a temp copy, then `os.replace`s atomically; the existing backup survives every failure path | `test_backup_failure_never_destroys_*` |
+| V42 | `backup` resolved a symlinked `--out` and `--force` clobbered the link's target — an unrelated file the operator never named | `backup` refuses a symlinked output path and keys its overwrite guard off the literal named path | `test_backup_refuses_to_follow_a_symlinked_target` |
+| V43 | A new database briefly existed at `0666 & ~umask` (0644) between `sqlite3.connect` and `os.chmod(0600)`; a racing local reader could retain an fd (V38 TOCTOU) | Creation runs under a `0o077` umask so the file is 0600 at first byte; the explicit chmod remains as a backstop | `test_new_database_is_never_observable_at_a_permissive_mode` |
 
 ## Prompt-injection analysis
 
