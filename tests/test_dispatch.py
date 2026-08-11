@@ -793,5 +793,245 @@ class TestHardening(Base):
         self.assertFalse(missing.exists())
 
 
+class TestV22Hardening(Base):
+    """Executable evidence for the version-2.2 review fixes (V36-V40)."""
+
+    def test_V36_schema_invalid_output_is_not_a_succeeded_ledger_call(self):
+        client = FakeClient(worker={"text": "not json at all"})
+        self.enqueue_section()
+        dispatch.run(client, dispatch.Budget(max_calls=20), self.db_path)
+        outcomes = {
+            row["outcome"]: row["count"]
+            for row in self.conn.execute(
+                "SELECT outcome,COUNT(*) AS count FROM model_calls GROUP BY outcome"
+            )
+        }
+        # T1 invalid escalates to T2; T2 retries to the attempt cap. Every one
+        # of those transport-successful-but-unusable calls must be recorded as
+        # rejected_output, or calibration metrics read them as good output.
+        self.assertNotIn("succeeded", outcomes)
+        self.assertEqual(sum(outcomes.values()), outcomes.get("rejected_output"))
+        self.assertFalse(dispatch.audit_database(self.conn))
+
+    def test_V36_invalid_critic_output_is_rejected_in_ledger(self):
+        client = FakeClient(worker=scout_envelope(), critic={"text": "looks fine to me"})
+        self.enqueue_scout()
+        dispatch.run(client, dispatch.Budget(max_calls=30), self.db_path)
+        critic_outcomes = [
+            row["outcome"]
+            for row in self.conn.execute("SELECT outcome FROM model_calls WHERE tier='T3_critic'")
+        ]
+        self.assertTrue(critic_outcomes)
+        self.assertEqual(set(critic_outcomes), {"rejected_output"})
+
+    def test_V37_api_key_never_travels_cleartext_to_a_remote_host(self):
+        import os as _os
+        from unittest import mock
+
+        with mock.patch.dict(_os.environ, {"V37_KEY": "secret-value"}):
+            remote = dispatch.HttpModelClient("openai", "http://remote.example", "V37_KEY")
+            with self.assertRaises(dispatch.DispatchError):
+                remote.preflight()
+            with self.assertRaises(dispatch.DispatchError):
+                remote.complete("m", "system", "user", 10, 5)
+            loopback = dispatch.HttpModelClient("openai", "http://127.0.0.1:9", "V37_KEY")
+            loopback.preflight()  # cleartext to loopback stays allowed
+
+    def test_V38_new_database_and_lock_are_owner_only(self):
+        mode = os.stat(self.db_path).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+        with dispatch.DispatcherLock(self.db_path, "perm-test") as lock:
+            lock_mode = os.stat(lock.path).st_mode & 0o777
+        self.assertEqual(lock_mode, 0o600)
+
+    def test_V39_event_chain_verifies_and_detects_tampering(self):
+        client = FakeClient(worker=section_envelope(), critic=PASS)
+        self.enqueue_section()
+        dispatch.run(client, dispatch.Budget(max_calls=10), self.db_path)
+        self.assertFalse(dispatch.audit_database(self.conn))
+        head = dispatch.status_snapshot(self.conn)["event_log"]["chain_head"]
+        self.assertEqual(len(head), 64)
+        self.assertNotEqual(head, dispatch.EVENT_CHAIN_GENESIS)
+        self.conn.execute("UPDATE events SET detail='{\"forged\":true}' WHERE id=2")
+        rules = [v["rule"] for v in dispatch.audit_database(self.conn)]
+        self.assertEqual(rules.count("event_chain"), 1)  # one edit, one violation
+
+    def test_V39_deleting_an_event_row_breaks_the_chain(self):
+        client = FakeClient(worker=section_envelope())
+        self.enqueue_section()
+        dispatch.run(client, dispatch.Budget(max_calls=10), self.db_path)
+        self.conn.execute("DELETE FROM events WHERE id=(SELECT MIN(id) FROM events)")
+        rules = {v["rule"] for v in dispatch.audit_database(self.conn)}
+        self.assertIn("event_chain", rules)
+
+    def test_V39_legacy_database_events_are_chained_at_migration(self):
+        path = Path(self.temporary.name) / "legacy-events.db"
+        legacy = sqlite3.connect(path)
+        legacy.executescript(
+            """
+            CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                tier TEXT NOT NULL, payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                confidence REAL, result TEXT, parent_id INTEGER, updated REAL
+            );
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER,
+                event TEXT NOT NULL, detail TEXT NOT NULL, created REAL NOT NULL
+            );
+            INSERT INTO events(job_id,event,detail,created) VALUES (NULL,'legacy','{}',1);
+            INSERT INTO events(job_id,event,detail,created) VALUES (NULL,'legacy2','{}',2);
+            """
+        )
+        legacy.close()
+        migrated = dispatch.db(path)
+        try:
+            hashes = migrated.execute(
+                "SELECT prev_hash,row_hash FROM events ORDER BY id"
+            ).fetchall()
+            self.assertEqual(hashes[0]["prev_hash"], dispatch.EVENT_CHAIN_GENESIS)
+            self.assertEqual(hashes[1]["prev_hash"], hashes[0]["row_hash"])
+            self.assertFalse(
+                [v for v in dispatch.audit_database(migrated) if v["rule"] == "event_chain"]
+            )
+        finally:
+            migrated.close()
+
+    def test_V40_crash_orphaned_reservation_is_visible_and_recoverable(self):
+        class CrashMidCall(dispatch.ModelClient):
+            def complete(self, *_args, **_kwargs):
+                raise KeyboardInterrupt  # crash after reservation, before response
+
+        self.enqueue_section()
+        with self.assertRaises(KeyboardInterrupt):
+            dispatch.run(CrashMidCall(), dispatch.Budget(max_calls=10), self.db_path)
+        snapshot = dispatch.status_snapshot(self.conn)
+        self.assertEqual(snapshot["orphaned_reservations"]["calls"], 1)
+        self.assertGreater(snapshot["orphaned_reservations"]["input_chars"], 0)
+        # The job is still leased 'running'; expire the lease and recover.
+        self.conn.execute("UPDATE jobs SET lease_expires=0 WHERE status='running'")
+        recovered = dispatch.recover_stale_jobs(self.conn)
+        self.assertEqual(recovered, 1)
+        self.assertEqual(self.counts().get("pending"), 1)
+        self.assertFalse(dispatch.audit_database(self.conn))
+        # The reservation is conservatively retained, and remains visible.
+        after = dispatch.status_snapshot(self.conn)
+        self.assertEqual(after["orphaned_reservations"]["calls"], 1)
+        self.assertEqual(after["campaign_budget"]["calls_reserved"], 1)
+
+    def test_metrics_reports_schema_valid_rate_and_calls_per_committed(self):
+        calls = {"n": 0}
+
+        def worker(_model, _system, _user, _max_tokens, _timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"text": "malformed"}
+            return section_envelope()
+
+        self.enqueue_section()
+        dispatch.run(FakeClient(worker=worker), dispatch.Budget(max_calls=10), self.db_path)
+        metrics = dispatch.metrics_snapshot(self.conn)
+        t1 = metrics["per_tier"]["T1_extract"]
+        self.assertEqual(t1["outcomes"], {"rejected_output": 1})
+        t2 = metrics["per_tier"]["T2_synth"]
+        self.assertEqual(t2["outcomes"], {"succeeded": 1})
+        self.assertEqual(t2["schema_valid_rate"], 1.0)
+        self.assertEqual(metrics["committed_workers"], 1)
+        self.assertEqual(metrics["calls_per_committed_worker"], 2.0)
+        self.assertEqual(metrics["escalations"], 1)
+
+    def test_backup_verifies_copy_and_refuses_silent_overwrite(self):
+        client = FakeClient(worker=section_envelope(), critic=PASS)
+        self.enqueue_section()
+        dispatch.run(client, dispatch.Budget(max_calls=10), self.db_path)
+        target = Path(self.temporary.name) / "backup.db"
+        summary = dispatch.backup_database(self.conn, target)
+        self.assertEqual(summary["checks"]["integrity_check"], "ok")
+        self.assertTrue(summary["checks"]["chain_head_match"])
+        copy = dispatch.db(target)
+        try:
+            self.assertFalse(dispatch.audit_database(copy))
+        finally:
+            copy.close()
+        with self.assertRaises(dispatch.DispatchError):
+            dispatch.backup_database(self.conn, target)
+        again = dispatch.backup_database(self.conn, target, force=True)
+        self.assertTrue(again["checks"]["jobs_count_match"])
+        with self.assertRaises(dispatch.DispatchError):
+            dispatch.backup_database(self.conn, self.db_path)
+
+    def test_backup_failure_never_destroys_the_existing_backup(self):
+        client = FakeClient(worker=section_envelope())
+        self.enqueue_section()
+        dispatch.run(client, dispatch.Budget(max_calls=10), self.db_path)
+        target = Path(self.temporary.name) / "keep.db"
+        dispatch.backup_database(self.conn, target)
+        self.assertTrue(target.exists())
+        original = target.read_bytes()
+        # Force a failure (open transaction) on a --force overwrite: the prior
+        # backup must survive intact, with no orphaned temp file left behind.
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            with self.assertRaises(dispatch.DispatchError):
+                dispatch.backup_database(self.conn, target, force=True)
+        finally:
+            self.conn.rollback()
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_bytes(), original)
+        leftovers = list(Path(self.temporary.name).glob("keep.db.tmp-*"))
+        self.assertEqual(leftovers, [])
+
+    def test_backup_refuses_to_follow_a_symlinked_target(self):
+        client = FakeClient(worker=section_envelope())
+        self.enqueue_section()
+        dispatch.run(client, dispatch.Budget(max_calls=10), self.db_path)
+        victim = Path(self.temporary.name) / "precious.txt"
+        victim.write_bytes(b"PRECIOUS-NON-BACKUP-FILE")
+        link = Path(self.temporary.name) / "backup-link.db"
+        link.symlink_to(victim)
+        with self.assertRaises(dispatch.DispatchError):
+            dispatch.backup_database(self.conn, link, force=True)
+        # The unrelated file the symlink pointed at must be untouched.
+        self.assertEqual(victim.read_bytes(), b"PRECIOUS-NON-BACKUP-FILE")
+
+    def test_new_database_is_never_observable_at_a_permissive_mode(self):
+        old_umask = os.umask(0o022)
+        try:
+            path = Path(self.temporary.name) / "fresh.db"
+            observed = {}
+            real_chmod = os.chmod
+
+            def spy(target, mode):
+                if str(target) == str(path):
+                    observed["mode_before_chmod"] = os.stat(target).st_mode & 0o777
+                return real_chmod(target, mode)
+
+            os.chmod = spy
+            try:
+                dispatch.db(path).close()
+            finally:
+                os.chmod = real_chmod
+            # The file must already be owner-only when the explicit chmod runs,
+            # i.e. no 0644 window ever existed.
+            self.assertEqual(observed.get("mode_before_chmod"), 0o600)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        finally:
+            os.umask(old_umask)
+
+    def test_backup_cli_round_trip(self):
+        client = FakeClient(worker=section_envelope())
+        self.enqueue_section()
+        dispatch.run(client, dispatch.Budget(max_calls=10), self.db_path)
+        target = Path(self.temporary.name) / "cli-backup.db"
+        code = dispatch.main(["--db", str(self.db_path), "backup", "--out", str(target)])
+        self.assertEqual(code, 0)
+        self.assertTrue(target.exists())
+        self.assertNotEqual(
+            dispatch.main(["--db", str(self.db_path), "backup", "--out", str(target)]), 0
+        )
+        code = dispatch.main(["--db", str(self.db_path), "metrics"])
+        self.assertEqual(code, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

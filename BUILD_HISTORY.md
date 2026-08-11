@@ -77,3 +77,33 @@ when pointed at a missing path; it now refuses like the other
 existing-database commands. Design positions defended and kept: sequential
 single-dispatcher, char-based budgets as floors under token ledgers, and
 fail-closed validation.
+
+## 2026-08-11 — Version 2.2 operational hardening (security-audit session)
+
+A full-repo security audit (executed probes, not style review) found one HIGH
+fail-open defect: model output containing an oversized integer literal or
+deeply nested JSON escaped as OverflowError/RecursionError — neither is a
+ValidationError — crashing the run and `audit` and stranding the job leased
+`running` (fixed as V35, merged separately). The audit's roadmap items were
+then implemented in this pass:
+
+- The Gate-3 calibration corpus finally exists as data: 18 fictional,
+  adversarially reviewed cases across all eight strata under
+  `calibration/`, with a validate/run/score harness whose release bar is
+  executable (any flawed case the code-level gate would commit exits
+  nonzero). Corpus authoring used a two-phase agent swarm (8 stratum authors,
+  8 adversarial reviewers that executed the real validators); gold labels
+  remain provisional until the two-human reconciliation.
+- V36–V40 operational fixes with tests: honest `rejected_output` ledger
+  outcome, no API keys over cleartext http to remote hosts, 0600
+  database/lock creation, a hash-chained event log verified by `audit`
+  with the chain head exposed for external archival, and visible
+  crash-orphaned budget reservations.
+- New `metrics` (per-tier schema-valid rate, escalations, calls per
+  committed worker, rework outcomes) and `backup` (VACUUM INTO plus
+  integrity/row-count/chain-head verification) commands, plus a crash-drill
+  test that kills a run mid-call and proves recovery keeps every invariant.
+
+Known limits unchanged: no live-model calibration numbers yet (gold labels
+await human reconciliation; run `calibration/calibrate.py`), and the event
+chain is tamper *evidence* only if its head is archived off-host.

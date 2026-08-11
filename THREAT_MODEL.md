@@ -66,6 +66,15 @@ evidence acquisition performed outside the process.
 | V32 | Token-limit truncation was invisible; truncated output could reach validation looking merely malformed | `stop_reason`/`finish_reason` are inspected; truncation fails closed as a named `ValidationError` | `TestTruncationDetection` |
 | V33 | Ambient `HTTPS_PROXY` environment variables silently routed key-bearing traffic through unaudited proxies | Openers ignore ambient proxy variables; `RALPH_HTTPS_PROXY` is the only, explicit, opt-in | `TestProxyPolicy` |
 | V34 | Publishing required raw SQL against the database, bypassing every invariant | `export` re-audits the database and refuses to emit from one that violates its own invariants unless `--allow-dirty` is passed, which marks records `audit_clean:false` | export tests |
+| V35 | Oversized integer literals and deep nesting in model output raised `OverflowError`/`RecursionError`, which are not `ValidationError`s; one crafted response crashed the run and `audit`, leaving the job leased `running` | `_finite_number` catches `OverflowError` and `_parse_json_object` catches `RecursionError`, both re-raised as `ValidationError` so the escalate/park paths handle them | `test_V35_*` |
+| V36 | The call ledger marked any transport-successful call `succeeded`, so schema-invalid output inflated every calibration metric derived from it | Output that fails validation downgrades its ledger row to `rejected_output`; `metrics` computes schema-valid rate from usable output only | `test_V36_*` |
+| V37 | An API key configured with a plain-http remote base URL would be transmitted in cleartext | Preflight and `complete` refuse key-bearing requests over http to any non-loopback host; loopback inference servers remain usable | `test_V37_*` |
+| V38 | Databases and lock files were created at default umask; evidence text could be world-readable on a shared host | New databases and lock files are created owner-only (0600); SQLite WAL/SHM inherit the database mode | `test_V38_*` |
+| V39 | The event log was append-only by convention; a quiet UPDATE or DELETE left no trace | Each event row hash-chains to its predecessor; `audit` re-derives the chain and flags any edit, insert, or deletion; `status` and `backup` expose the chain head for external archival | `test_V39_*` |
+| V40 | Crash-orphaned budget reservations accumulated invisibly, silently eroding campaign headroom until a mystery ceiling hit | `status` reports orphaned (`reserved`-outcome) calls and input characters so drift is visible; reservations remain conservatively retained by design | `test_V40_*` |
+| V41 | `backup` unlinked the existing target before validating preconditions/writing, so any failure (open transaction, disk full) destroyed the prior backup with no replacement | `backup` validates every precondition first, writes/verifies a temp copy, then `os.replace`s atomically; the existing backup survives every failure path | `test_backup_failure_never_destroys_*` |
+| V42 | `backup` resolved a symlinked `--out` and `--force` clobbered the link's target — an unrelated file the operator never named | `backup` refuses a symlinked output path and keys its overwrite guard off the literal named path | `test_backup_refuses_to_follow_a_symlinked_target` |
+| V43 | A new database briefly existed at `0666 & ~umask` (0644) between `sqlite3.connect` and `os.chmod(0600)`; a racing local reader could retain an fd (V38 TOCTOU) | Creation runs under a `0o077` umask so the file is 0600 at first byte; the explicit chmod remains as a backstop | `test_new_database_is_never_observable_at_a_permissive_mode` |
 
 ## Prompt-injection analysis
 
@@ -109,15 +118,22 @@ or publishing connector is a material scope change and invalidates this review.
 10. **Error classification trusts status codes.** A provider that returns 200
     with an error body, or 429 for a permanent condition, will be routed by the
     code it chose, not the condition it meant.
-9. **Sensitive content.** Key-name rejection is not semantic DLP. A secret can
-   appear under an innocent key or inside an excerpt.
-10. **Human process.** Direct SQL can violate every state invariant. Restrict
+11. **Sensitive content.** Key-name rejection is not semantic DLP. A secret can
+    appear under an innocent key or inside an excerpt.
+12. **Human process.** Direct SQL can violate every state invariant. Restrict
     database write access and do not “fix” `needs_human` rows manually.
-11. **Ambiguous external-call completion.** A crash after the provider accepts a
+13. **Ambiguous external-call completion.** A crash after the provider accepts a
     request but before the job transition can cause a bounded duplicate call on
     lease recovery. The conservative call reservation remains in the ledger;
     exactly-once model execution requires provider idempotency support that the
     two generic protocols do not guarantee.
+14. **Chain detection, not prevention.** The event hash chain (V39) turns silent
+    history edits into audit violations, but an administrator who can rewrite
+    SQLite can re-chain the whole log, and truncating only the newest rows moves
+    the head without an internal mismatch. Tamper *evidence* against a capable
+    admin still requires archiving the chain head (reported by `status` and
+    `backup`) outside the mutable host after each run. Pre-migration rows are
+    chained retroactively and attest nothing about edits made before migration.
 
 ## Validation status
 
