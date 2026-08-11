@@ -1086,6 +1086,11 @@ def _parse_json_object(text: str, label: str) -> dict[str, Any]:
             parse_constant=reject_constant,
             object_pairs_hook=reject_duplicate_keys,
         )
+    except RecursionError as exc:
+        # Deeply nested arrays/objects within the response byte cap can exhaust
+        # the interpreter stack; fail closed as a named validation error rather
+        # than letting RecursionError escape the dispatch loop.
+        raise ValidationError(f"{label} is nested too deeply") from exc
     except (json.JSONDecodeError, TypeError) as exc:
         raise ValidationError(f"{label} must be one JSON object") from exc
     if not isinstance(value, dict):
@@ -1098,7 +1103,11 @@ def _finite_number(value: Any, label: str, low: float, high: float) -> float:
         raise ValidationError(f"{label} must be numeric")
     try:
         number = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
+        # A JSON integer literal is unbounded, so float() can raise OverflowError
+        # ("int too large to convert to float") rather than ValueError. Treat it
+        # as invalid numeric input instead of letting it escape as an
+        # unhandled arithmetic error.
         raise ValidationError(f"{label} must be numeric") from exc
     if not math.isfinite(number) or not low <= number <= high:
         raise ValidationError(f"{label} must be finite and between {low} and {high}")
