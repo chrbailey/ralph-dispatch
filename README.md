@@ -74,6 +74,33 @@ test.
   reports how many need human review; `run --verbose` streams per-call
   progress to stderr.
 
+## What changed in version 2.2
+
+Version 2.2 closes the operational findings from an external security audit
+(V35–V40, each with a threat-table entry and tests) and adds the two operator
+commands that audit called missing.
+
+- **Fail-closed numeric parsing.** Oversized integer literals and deeply
+  nested JSON in model output previously escaped as `OverflowError` /
+  `RecursionError` and crashed the run; both now fail closed as named
+  validation errors.
+- **Honest call ledger.** A transport-successful call whose output fails
+  validation is recorded as `rejected_output`, not `succeeded`, so calibration
+  metrics measure usable output.
+- **Tamper-evident event log.** Every event hash-chains to its predecessor;
+  `audit` verifies the chain and flags edits, insertions, and deletions.
+  `status` and `backup` report the chain head for external archival.
+- **Transport and file hygiene.** API keys are never sent over cleartext http
+  to a non-loopback host; new databases and lock files are owner-only (0600).
+- **Budget drift visibility.** `status` reports crash-orphaned reservations so
+  conservatively retained headroom loss is visible before it bites.
+- **`metrics` and `backup`.** `metrics` computes the validation protocol's
+  ledger KPIs (per-tier schema-valid rate, escalations, calls per committed
+  worker, rework outcomes). `backup` copies via `VACUUM INTO` and verifies the
+  copy (integrity check, row counts, chain head) before trusting it.
+
+The Gate-3 calibration corpus and scoring harness live in `calibration/`.
+
 ## State machine
 
 ```text
@@ -128,8 +155,14 @@ After a run:
 
 ```bash
 python dispatch.py --db dispatch.db audit
+python dispatch.py --db dispatch.db metrics
 python dispatch.py --db dispatch.db events --limit 100
+python dispatch.py --db dispatch.db backup --out backups/dispatch-$(date +%F).db
 ```
+
+Archive the `chain_head` reported by `status`/`backup` outside the host after
+each run; it is the external anchor that makes the event chain tamper-evident
+against database rewrites.
 
 Publish or merge only committed worker results after `audit` reports
 `"clean": true`.

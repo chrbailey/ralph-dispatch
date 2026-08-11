@@ -362,11 +362,13 @@ CREATE TABLE IF NOT EXISTS job_dependencies (
 );
 
 CREATE TABLE IF NOT EXISTS events (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id   INTEGER REFERENCES jobs(id),
-    event    TEXT NOT NULL,
-    detail   TEXT NOT NULL,
-    created  REAL NOT NULL
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id     INTEGER REFERENCES jobs(id),
+    event      TEXT NOT NULL,
+    detail     TEXT NOT NULL,
+    created    REAL NOT NULL,
+    prev_hash  TEXT,
+    row_hash   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -438,6 +440,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         for name, declaration in _MIGRATION_COLUMNS.items():
             if name not in columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {declaration}")
+    events_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+    ).fetchone()
+    if events_exists:
+        event_columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+        for name in ("prev_hash", "row_hash"):
+            if name not in event_columns:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {name} TEXT")
     conn.executescript(SCHEMA)
 
     timestamp = now()
@@ -470,6 +480,24 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "VALUES (1,?,?,?,?,?)",
             (MAX_CALLS_PER_CAMPAIGN, MAX_INPUT_CHARS_PER_CAMPAIGN, 0, 0, timestamp),
         )
+        unchained = conn.execute("SELECT COUNT(*) FROM events WHERE row_hash IS NULL").fetchone()[0]
+        if unchained:
+            # Retroactively chain pre-v2.2 rows (and finish a chain interrupted
+            # mid-migration) by recomputing the whole chain in id order. The
+            # chain attests integrity only from this migration forward; rows
+            # rewritten before it cannot be detected retroactively.
+            prev_hash = EVENT_CHAIN_GENESIS
+            for row in conn.execute(
+                "SELECT id,job_id,event,detail,created FROM events ORDER BY id"
+            ).fetchall():
+                row_hash = _event_row_hash(
+                    prev_hash, row["job_id"], row["event"], row["detail"], row["created"]
+                )
+                conn.execute(
+                    "UPDATE events SET prev_hash=?,row_hash=? WHERE id=?",
+                    (prev_hash, row_hash, row["id"]),
+                )
+                prev_hash = row_hash
         conn.execute("PRAGMA user_version=2")
 
 
@@ -481,7 +509,15 @@ def db(
     db_path = resolve_db_path(path)
     if not db_path.parent.is_dir():
         raise FileNotFoundError(f"database directory does not exist: {db_path.parent}")
+    creating = not db_path.exists()
     conn = sqlite3.connect(str(db_path), timeout=30, isolation_level=None)
+    if creating:
+        # Evidence excerpts and research text live in this file; keep a fresh
+        # database owner-only. SQLite creates -wal/-shm with the same mode.
+        # An operator who widened permissions deliberately is not overridden
+        # because only newly created databases are chmodded.
+        with contextlib.suppress(OSError):
+            os.chmod(db_path, 0o600)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
@@ -493,6 +529,25 @@ def db(
     return conn
 
 
+EVENT_CHAIN_GENESIS = "0" * 64
+
+
+def _event_row_hash(
+    prev_hash: str, job_id: int | None, event: str, detail: str, created: float
+) -> str:
+    payload = canonical_json(
+        {"job_id": job_id, "event": event, "detail": detail, "created": created}
+    )
+    return sha256_text(prev_hash + payload)
+
+
+def _event_chain_head(conn: sqlite3.Connection) -> str:
+    row = conn.execute("SELECT row_hash FROM events ORDER BY id DESC LIMIT 1").fetchone()
+    if row is None or row["row_hash"] is None:
+        return EVENT_CHAIN_GENESIS
+    return row["row_hash"]
+
+
 def log_event(
     conn: sqlite3.Connection,
     job_id: int | None,
@@ -502,9 +557,23 @@ def log_event(
     if not event or len(event) > 80:
         raise ValueError("event name must contain 1-80 characters")
     encoded = _bounded_json(detail or {}, MAX_EVENT_DETAIL_BYTES, "event detail")
+    timestamp = now()
+    # Hash-chain each event to its predecessor. Rewriting or deleting any row
+    # breaks every later hash, turning silent history edits into an audit
+    # violation. This detects tampering; it cannot prevent an administrator
+    # from re-chaining the whole log, which still requires the externally
+    # archived chain head (see THREAT_MODEL residual risks).
+    prev_hash = _event_chain_head(conn)
     conn.execute(
-        "INSERT INTO events(job_id,event,detail,created) VALUES (?,?,?,?)",
-        (job_id, event, encoded, now()),
+        "INSERT INTO events(job_id,event,detail,created,prev_hash,row_hash) VALUES (?,?,?,?,?,?)",
+        (
+            job_id,
+            event,
+            encoded,
+            timestamp,
+            prev_hash,
+            _event_row_hash(prev_hash, job_id, event, encoded, timestamp),
+        ),
     )
 
 
@@ -822,6 +891,25 @@ class HttpModelClient(ModelClient):
     def _api_key(self) -> str | None:
         return os.getenv(self.api_key_env) if self.api_key_env else None
 
+    def _require_key_transport_security(self) -> None:
+        """Never send an API key in cleartext to another machine.
+
+        Plain http is acceptable only for loopback endpoints (a local
+        inference server). A remote http base_url with a configured key would
+        transmit the credential unencrypted; refuse before any request.
+        """
+        parsed = urllib.parse.urlsplit(self.base_url)
+        local_hosts = {"127.0.0.1", "::1", "localhost"}
+        if (
+            parsed.scheme.lower() == "http"
+            and parsed.hostname not in local_hosts
+            and self._api_key()
+        ):
+            raise DispatchError(
+                "refusing to send an API key over cleartext http to a non-local host; "
+                "use https or an empty --api-key-env for an unauthenticated endpoint"
+            )
+
     def preflight(self) -> None:
         provider = self.provider.lower()
         if provider not in {"anthropic", "openai"}:
@@ -832,6 +920,7 @@ class HttpModelClient(ModelClient):
             raise DispatchError("request timeout must be positive")
         if provider == "anthropic" and not self._api_key():
             raise DispatchError(f"missing API key in {self.api_key_env}")
+        self._require_key_transport_security()
         hostname = urllib.parse.urlsplit(self.base_url).hostname
         local_hosts = {"127.0.0.1", "::1", "localhost"}
         if (
@@ -856,6 +945,7 @@ class HttpModelClient(ModelClient):
         provider = self.provider.lower()
         base = self.base_url.rstrip("/")
         headers = {"content-type": "application/json", "user-agent": "ralph-dispatch/2"}
+        self._require_key_transport_security()  # Defense in depth beyond preflight.
         api_key = self._api_key()
         timeout = max(0.1, min(self.request_timeout, timeout_seconds))
 
@@ -1480,7 +1570,8 @@ class DispatcherLock:
     def __enter__(self) -> DispatcherLock:
         if fcntl is None:
             raise DispatchError("single-dispatcher locking requires fcntl on this host")
-        self._handle = self.path.open("a+", encoding="utf-8")
+        descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        self._handle = os.fdopen(descriptor, "r+", encoding="utf-8")
         try:
             fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
@@ -1619,6 +1710,22 @@ def _retry_or_park(
         log_event(conn, job.id, event, {"status": status, "attempt": job.attempts})
         if status == "needs_human" and job.kind == "critic_review":
             _park_parent(conn, job.parent_id, reason)
+
+
+def _mark_call_rejected(conn: sqlite3.Connection, call_id: int, exc: Exception) -> None:
+    """Downgrade a transport-successful call whose output failed validation.
+
+    'succeeded' in the ledger previously meant only that HTTP returned, so
+    schema-invalid responses inflated every calibration metric derived from
+    it (worker schema-valid rate, false-pass denominators). A distinct
+    'rejected_output' outcome keeps transport success and usable output
+    separate; the calibration protocol reads the latter.
+    """
+    with transaction(conn):
+        conn.execute(
+            "UPDATE model_calls SET outcome='rejected_output',error=? WHERE id=?",
+            (_safe_error(exc), call_id),
+        )
 
 
 def _handle_worker_success(
@@ -1802,12 +1909,14 @@ def drain_tier(
                 verdict = parse_critic_response(response.text)
                 route_critic_verdict(conn, job.id, verdict)
             except ValidationError as exc:
+                _mark_call_rejected(conn, call_id, exc)
                 _retry_or_park(conn, job, _safe_error(exc), "critic_output_rejected")
         else:
             try:
                 envelope, confidence = parse_worker_response(job.kind, response.text, job.payload)
                 _handle_worker_success(conn, job, envelope, confidence)
             except ValidationError as exc:
+                _mark_call_rejected(conn, call_id, exc)
                 promoted = next_tier(job.tier)
                 if promoted is not None:
                     with transaction(conn):
@@ -1935,7 +2044,148 @@ def status_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
             "AS failed_calls FROM model_calls"
         ).fetchone()
     )
-    return {"jobs": jobs, "campaign_budget": campaign, "model_usage": usage}
+    # Crash-orphaned reservations never resolve to succeeded/failed and are
+    # never reclaimed (the conservative-budget contract), so an unattended
+    # crashy deployment silently loses campaign headroom. Surface the drift
+    # so the operator sees it coming instead of hitting a mystery ceiling.
+    orphaned = dict(
+        conn.execute(
+            "SELECT COUNT(*) AS calls,COALESCE(SUM(input_chars),0) AS input_chars "
+            "FROM model_calls WHERE outcome='reserved'"
+        ).fetchone()
+    )
+    events_summary = {
+        "count": conn.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+        "chain_head": _event_chain_head(conn),
+    }
+    return {
+        "jobs": jobs,
+        "campaign_budget": campaign,
+        "model_usage": usage,
+        "orphaned_reservations": orphaned,
+        "event_log": events_summary,
+    }
+
+
+def metrics_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Compute the calibration KPIs the validation protocol reads from the ledger.
+
+    schema_valid_rate divides usable responses by all responses received
+    (succeeded + rejected_output); transport failures and crash-orphaned
+    reservations are excluded from that denominator but reported alongside.
+    """
+    per_tier: dict[str, dict[str, Any]] = {}
+    for row in conn.execute(
+        "SELECT tier,outcome,COUNT(*) AS count,"
+        "COALESCE(SUM(input_tokens),0) AS input_tokens,"
+        "COALESCE(SUM(output_tokens),0) AS output_tokens "
+        "FROM model_calls GROUP BY tier,outcome"
+    ):
+        tier = per_tier.setdefault(
+            row["tier"],
+            {
+                "calls": 0,
+                "outcomes": {},
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "schema_valid_rate": None,
+            },
+        )
+        tier["calls"] += row["count"]
+        tier["outcomes"][row["outcome"]] = row["count"]
+        tier["input_tokens"] += row["input_tokens"]
+        tier["output_tokens"] += row["output_tokens"]
+    for tier in per_tier.values():
+        succeeded = tier["outcomes"].get("succeeded", 0)
+        rejected = tier["outcomes"].get("rejected_output", 0)
+        if succeeded + rejected:
+            tier["schema_valid_rate"] = succeeded / (succeeded + rejected)
+
+    committed_workers = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE status='committed' AND kind!='critic_review'"
+    ).fetchone()[0]
+    total_calls = conn.execute("SELECT COUNT(*) FROM model_calls").fetchone()[0]
+    escalations = conn.execute(
+        "SELECT COUNT(*) FROM events WHERE event IN ('escalated','invalid_output_escalated')"
+    ).fetchone()[0]
+    rework = dict(
+        conn.execute(
+            "SELECT COALESCE(SUM(CASE WHEN status='committed' THEN 1 ELSE 0 END),0) "
+            "AS committed,"
+            "COALESCE(SUM(CASE WHEN status='needs_human' THEN 1 ELSE 0 END),0) "
+            "AS needs_human FROM jobs WHERE rework_count>0 AND kind!='critic_review'"
+        ).fetchone()
+    )
+    statuses = {
+        row["status"]: row["count"]
+        for row in conn.execute("SELECT status,COUNT(*) AS count FROM jobs GROUP BY status")
+    }
+    return {
+        "per_tier": per_tier,
+        "job_statuses": statuses,
+        "committed_workers": committed_workers,
+        "calls_per_committed_worker": (
+            total_calls / committed_workers if committed_workers else None
+        ),
+        "escalations": escalations,
+        "rework_lineages": rework,
+    }
+
+
+def backup_database(
+    conn: sqlite3.Connection,
+    out_path: str | os.PathLike[str],
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Copy the database with VACUUM INTO and verify the copy before trusting it.
+
+    Verification: integrity_check, matching user_version, matching jobs/events
+    row counts, and a matching event-chain head. A backup that cannot be read
+    back faithfully is worse than none, so any mismatch raises.
+    """
+    target = Path(out_path).expanduser().resolve(strict=False)
+    source = resolve_db_path(conn.execute("PRAGMA database_list").fetchone()[2])
+    if target == source:
+        raise DispatchError("backup target must differ from the live database path")
+    if target.exists():
+        if not force:
+            raise DispatchError(f"backup target exists; pass --force to replace: {target}")
+        target.unlink()
+    if conn.in_transaction:
+        raise DispatchError("cannot back up inside an open transaction")
+    conn.execute("VACUUM INTO ?", (str(target),))
+    with contextlib.suppress(OSError):
+        os.chmod(target, 0o600)
+    copy = sqlite3.connect(str(target))
+    copy.row_factory = sqlite3.Row
+    try:
+        integrity = copy.execute("PRAGMA integrity_check").fetchone()[0]
+        checks = {
+            "integrity_check": integrity,
+            "user_version_match": (
+                copy.execute("PRAGMA user_version").fetchone()[0]
+                == conn.execute("PRAGMA user_version").fetchone()[0]
+            ),
+            "jobs_count_match": (
+                copy.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+                == conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+            ),
+            "events_count_match": (
+                copy.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                == conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+            ),
+            "chain_head_match": _event_chain_head(copy) == _event_chain_head(conn),
+        }
+    finally:
+        copy.close()
+    if integrity != "ok" or not all(
+        value is True for key, value in checks.items() if key != "integrity_check"
+    ):
+        with contextlib.suppress(OSError):
+            target.unlink()
+        raise DispatchError(f"backup verification failed: {checks}")
+    return {"backup": str(target), "checks": checks, "chain_head": _event_chain_head(conn)}
 
 
 def audit_database(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -2037,7 +2287,7 @@ def audit_database(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     if call_records > campaign["calls_reserved"]:
         violations.append({"job_id": None, "rule": "model_call_ledger_bounds"})
     for call in conn.execute("SELECT * FROM model_calls"):
-        if call["outcome"] not in {"reserved", "succeeded", "failed"}:
+        if call["outcome"] not in {"reserved", "succeeded", "failed", "rejected_output"}:
             violations.append({"job_id": call["job_id"], "rule": "model_call_outcome"})
         if (
             call["input_chars"] < 0
@@ -2045,6 +2295,24 @@ def audit_database(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             or (call["output_tokens"] is not None and call["output_tokens"] < 0)
         ):
             violations.append({"job_id": call["job_id"], "rule": "model_call_usage"})
+    expected_prev = EVENT_CHAIN_GENESIS
+    for event_row in conn.execute(
+        "SELECT id,job_id,event,detail,created,prev_hash,row_hash FROM events ORDER BY id"
+    ):
+        recomputed = _event_row_hash(
+            expected_prev,
+            event_row["job_id"],
+            event_row["event"],
+            event_row["detail"],
+            event_row["created"],
+        )
+        if event_row["prev_hash"] != expected_prev or event_row["row_hash"] != recomputed:
+            violations.append({"job_id": event_row["job_id"], "rule": "event_chain"})
+            # Resynchronize on the stored hash so one edit yields one
+            # violation instead of cascading over every later row.
+            expected_prev = event_row["row_hash"] or recomputed
+        else:
+            expected_prev = recomputed
     return violations
 
 
@@ -2142,6 +2410,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", help="show queue and persistent budget state")
     sub.add_parser("audit", help="check database invariants")
+    sub.add_parser("metrics", help="show calibration KPIs from the call ledger")
+    backup_parser = sub.add_parser("backup", help="copy the database and verify the copy")
+    backup_parser.add_argument("--out", required=True, help="backup file path")
+    backup_parser.add_argument(
+        "--force", action="store_true", help="replace an existing backup file"
+    )
     export_parser = sub.add_parser(
         "export", help="emit committed worker results as JSON lines after a clean audit"
     )
@@ -2171,6 +2445,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "run",
             "status",
             "audit",
+            "metrics",
+            "backup",
             "stop",
             "resume",
             "events",
@@ -2201,6 +2477,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _json_print({"job_id": job_id})
             elif args.command == "status":
                 _json_print(status_snapshot(conn))
+            elif args.command == "metrics":
+                _json_print(metrics_snapshot(conn))
+            elif args.command == "backup":
+                _json_print(backup_database(conn, args.out, force=args.force))
             elif args.command == "audit":
                 violations = audit_database(conn)
                 _json_print({"clean": not violations, "violations": violations})

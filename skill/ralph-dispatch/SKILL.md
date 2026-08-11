@@ -26,6 +26,10 @@ unless the user asks.
    `python dispatch.py --db dispatch.db audit`.
 8. Inspect transitions with
    `python dispatch.py --db dispatch.db events --job-id ID`.
+9. After each run, record the `chain_head` from
+   `python dispatch.py --db dispatch.db status` somewhere off-host, review
+   `python dispatch.py --db dispatch.db metrics`, and take a verified copy with
+   `python dispatch.py --db dispatch.db backup --out PATH`.
 
 Request a graceful halt with `python dispatch.py --db dispatch.db stop`. It
 takes effect before the next model call; an in-flight HTTP request remains

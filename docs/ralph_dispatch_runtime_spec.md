@@ -124,11 +124,17 @@ not pretend to implement.
 ## 8. Audit trail
 
 `events` is append-only under normal APIs and records state transitions without
-copying full work products or credentials into event details. `runs` records
-owner, start/end, stop reason, calls, and input characters. `model_calls`
-records the job, tier, model, client class, outcome, input size, and
-provider-reported token usage; a crash leaves a conservative `reserved` row.
-Each worker and critic result has a SHA-256 integrity hash.
+copying full work products or credentials into event details. Since v2.2 each
+event row also carries `prev_hash`/`row_hash`, hash-chaining it to its
+predecessor from a fixed genesis; `audit` re-derives the chain, so an UPDATE,
+DELETE, or out-of-band INSERT surfaces as an `event_chain` violation. The chain
+head is reported by `status` and `backup` and should be archived off-host to
+anchor tamper evidence. `runs` records owner, start/end, stop reason, calls,
+and input characters. `model_calls` records the job, tier, model, client class,
+outcome, input size, and provider-reported token usage; a crash leaves a
+conservative `reserved` row, and an output that fails validation downgrades the
+row to `rejected_output` so the ledger separates transport success from usable
+output. Each worker and critic result has a SHA-256 integrity hash.
 
 `dispatch.py audit` checks status/kind/tier values, attempts, result hashes,
 critic parents and tier, passing review before gated commit, active critics for
