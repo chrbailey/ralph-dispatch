@@ -681,6 +681,45 @@ class TestHardening(Base):
             {"task": "Discuss api_key rotation policy generally", "evidence": []},
         )
 
+    def test_V35_oversized_numeric_literals_fail_closed_not_crash(self):
+        # A JSON integer literal is unbounded; float() on it raises OverflowError,
+        # which is not a ValidationError and previously escaped the dispatch loop,
+        # crashing the whole run on a single crafted model response.
+        huge = "9" * 400
+        with self.assertRaises(dispatch.ValidationError):
+            dispatch.parse_worker_response(
+                "dossier_section",
+                '{"RESULT":{"section":"WHO","claims":[],"not_disclosed":["x"]},'
+                f'"CONFIDENCE":{huge}}}',
+                {"task": "Extract", "evidence": evidence()},
+            )
+        with self.assertRaises(dispatch.ValidationError):
+            dispatch.parse_critic_response(
+                f'{{"VERDICT":"PASS","RISK_SCORE":{huge},"CRITICAL_ISSUES":[],"MINOR_ISSUES":[]}}'
+            )
+
+    def test_V35_oversized_number_from_model_parks_instead_of_crashing_run(self):
+        huge = "9" * 400
+        bad = (
+            '{"RESULT":{"section":"WHO","claims":[],"not_disclosed":["x"]},'
+            f'"CONFIDENCE":{huge}}}'
+        )
+        client = FakeClient(worker={"text": bad})
+        job_id = self.enqueue_section()
+        summary = dispatch.run(client, dispatch.Budget(max_calls=10), self.db_path)
+        self.assertIn("drained", summary.stop_reason)
+        row = self.conn.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        self.assertEqual(row["status"], "needs_human")
+        run_row = self.conn.execute("SELECT ended FROM runs").fetchone()
+        self.assertIsNotNone(run_row["ended"])
+
+    def test_V35_deeply_nested_model_output_fails_closed(self):
+        nested = "[" * 6000 + "]" * 6000
+        with self.assertRaises(dispatch.ValidationError):
+            dispatch._parse_json_object(
+                '{"RESULT":' + nested + ',"CONFIDENCE":0.5}', "worker response"
+            )
+
     def test_transient_backoff_honors_retry_after_and_ceiling(self):
         original = dispatch.RETRY_BACKOFF_SECONDS
         try:
